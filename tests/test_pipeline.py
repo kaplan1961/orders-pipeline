@@ -17,6 +17,7 @@ from example_1.config import Settings
 from example_1.models import DailySales
 from example_1.pipeline import (
     ReconciliationError,
+    ReprocessError,
     SchemaDriftError,
     SourceFileChangedError,
     fetch_gold,
@@ -321,3 +322,86 @@ def test_unexpected_file_names_are_ignored(
     assert len(summary.files_loaded) == 2
     assert "orders_2024-13-01.csv" in caplog.text
     assert "orders_latest.csv" in caplog.text
+
+
+def test_rebuild_replays_silver_from_bronze(settings: Settings, database_url: str) -> None:
+    """--rebuild re-derives silver from bronze, undoing any drift, with identical results."""
+    run(settings)
+    with psycopg.connect(database_url) as conn:
+        conn.execute("UPDATE silver.orders SET quantity = 100 WHERE order_id = 'O1001'")
+        conn.execute("DELETE FROM silver.orders WHERE order_id = 'O2001'")
+    summary = run(settings, rebuild=True)
+    assert summary.silver_replayed is True
+    assert summary.files_loaded == ()
+    assert summary.dates_refreshed == (D1, D2)
+    assert gold(database_url) == EXPECTED_GOLD
+    assert scalar(database_url, "SELECT count(*) FROM silver.orders_quarantine") == 2
+    assert (
+        scalar(
+            database_url, "SELECT sum(rows_clean) FROM ops.load_ledger WHERE file_kind = 'orders'"
+        )
+        == 22
+    )
+
+
+def test_reprocess_accepts_corrected_file(settings: Settings, database_url: str) -> None:
+    """A corrected re-delivery replaces the old version and restates only what changed."""
+    run(settings)
+    day1 = settings.data_dir / "orders_2024-01-01.csv"
+    corrected = (
+        day1.read_text(encoding="utf-8")
+        .replace("O1001,2024-01-01,C001,P001,2,", "O1001,2024-01-01,C001,P001,3,")
+        .replace("O1007,2024-01-01,C006,P099,2,15.00,East\n", "")
+    )
+    day1.write_text(corrected, encoding="utf-8")
+    with pytest.raises(SourceFileChangedError, match="--reprocess"):
+        run(settings)
+
+    summary = run(settings, reprocess=["orders_2024-01-01.csv", "orders_2024-01-01.csv"])
+    assert summary.files_reprocessed == ("orders_2024-01-01.csv",)
+    result = gold(database_url)
+    assert result[(D1, "Electronics", "East")] == ("99.96", 2, 4, "49.98")
+    assert (D1, "Unknown", "East") not in result  # O1007 removed by the correction
+    assert result[(D1, "Stationery", "North")] == ("21.00", 1, 6, "21.00")  # day 2 still wins
+    assert scalar(database_url, "SELECT count(*) FROM bronze.orders_superseded") == 12
+    assert (
+        scalar(
+            database_url,
+            "SELECT count(*) FROM bronze.orders WHERE source_file = 'orders_2024-01-01.csv'",
+        )
+        == 11
+    )
+    assert run(settings).files_loaded == ()  # the new hash is accepted from now on
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("products.csv", "not a daily order file"),
+        ("orders_2024-01-09.csv", "not found"),
+        ("orders_2024-01-03.csv", "never loaded"),
+    ],
+)
+def test_reprocess_rejects_invalid_requests(settings: Settings, name: str, message: str) -> None:
+    """Reprocessing is only for daily order files that exist and were already loaded."""
+    add_order_file(
+        settings.data_dir, "orders_2024-01-03.csv", "O3001,2024-01-03,C1,P001,1,1.00,East"
+    )
+    with pytest.raises(ReprocessError, match=message):
+        run(settings, reprocess=[name])
+
+
+def test_cli_rebuild_and_reprocess_flags(settings: Settings) -> None:
+    """The CLI exposes --rebuild and --reprocess and exits 0 when they succeed."""
+    argv = [
+        "--database-url",
+        settings.database_url,
+        "--data-dir",
+        str(settings.data_dir),
+        "--out-dir",
+        str(settings.out_dir),
+    ]
+    assert main(argv) == 0
+    assert main([*argv, "--rebuild"]) == 0
+    assert main([*argv, "--reprocess", "orders_2024-01-02.csv"]) == 0
+    assert main([*argv, "--reprocess", "nope.csv"]) == 1

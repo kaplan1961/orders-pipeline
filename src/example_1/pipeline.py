@@ -10,9 +10,13 @@ Each run, inside one transaction guarded by an advisory lock:
 5. Reconcile gold totals against silver for those dates; any mismatch fails the run.
 
 Re-running with no new files is a no-op. A file whose content changed after it was loaded
-fails the run instead of being silently skipped or double counted.
+fails the run instead of being silently skipped or double counted; accept the corrected
+version explicitly with ``--reprocess FILE``. After a business-rule change, ``--rebuild``
+re-derives silver and gold from bronze.
 
 Run:  uv run orders-pipeline --data-dir data --out-dir out
+      uv run orders-pipeline --reprocess orders_2024-01-01.csv
+      uv run orders-pipeline --rebuild
 """
 
 from __future__ import annotations
@@ -87,6 +91,10 @@ class SourceFileChangedError(PipelineError):
 
 class MissingSourceFileError(PipelineError):
     """A required source file (the product reference) is not in the landing folder."""
+
+
+class ReprocessError(PipelineError):
+    """A ``--reprocess`` request names a file that cannot be reprocessed."""
 
 
 class ReconciliationError(PipelineError):
@@ -188,7 +196,7 @@ def discover_order_files(conn: Conn, data_dir: Path) -> list[tuple[Path, date]]:
             pending.append((path, file_date))
         elif known != file_sha256(path):
             raise SourceFileChangedError(
-                f"{path.name} changed after it was loaded; reprocess it explicitly"
+                f"{path.name} changed after it was loaded; accept it with --reprocess {path.name}"
             )
     return pending
 
@@ -383,20 +391,20 @@ def upsert_silver(
     return previous | {record.order_date for _, record in records}
 
 
-def load_order_file(conn: Conn, path: Path, file_date: date) -> FileLoadResult:
-    """Load one daily order file through bronze into silver and record it in the ledger.
+def build_silver(
+    conn: Conn, source_file: str, file_date: date, lines: list[RawLine]
+) -> FileLoadResult:
+    """Validate one file's lines into ``silver.orders`` or ``silver.orders_quarantine``.
 
     Args:
         conn: Open database connection (inside the run transaction).
-        path: Order file to load.
-        file_date: Date parsed from the file name.
+        source_file: File the lines came from.
+        file_date: Date from the file name, used to order deliveries.
+        lines: The file's raw lines, in file order.
 
     Returns:
         Counts and the order dates touched.
     """
-    lines = read_csv_lines(path, ORDER_COLUMNS)
-    ingest_bronze(conn, path.name, file_date, lines)
-
     clean: list[tuple[RawLine, OrderRecord]] = []
     rejected: list[tuple[RawLine, str]] = []
     for line in lines:
@@ -408,7 +416,7 @@ def load_order_file(conn: Conn, path: Path, file_date: date) -> FileLoadResult:
         if line.n_fields > len(ORDER_COLUMNS):
             logger.warning(
                 "%s line %d: %d extra field(s) ignored",
-                path.name,
+                source_file,
                 line.line_no,
                 line.n_fields - len(ORDER_COLUMNS),
             )
@@ -418,22 +426,44 @@ def load_order_file(conn: Conn, path: Path, file_date: date) -> FileLoadResult:
             "INSERT INTO silver.orders_quarantine (source_file, line_no, order_id, reason, "
             "raw_line) VALUES (%s, %s, %s, %s, %s)",
             [
-                (path.name, line.line_no, _first_field(line), reason, line.raw_line)
+                (source_file, line.line_no, _first_field(line), reason, line.raw_line)
                 for line, reason in rejected
             ],
         )
-    affected = upsert_silver(conn, path.name, file_date, clean)
-    conn.execute(
-        "INSERT INTO ops.load_ledger (source_file, file_kind, sha256, rows_read, rows_clean, "
-        "rows_quarantined) VALUES (%s, 'orders', %s, %s, %s, %s)",
-        (path.name, file_sha256(path), len(lines), len(clean), len(rejected)),
-    )
-    result = FileLoadResult(
-        source_file=path.name,
+    affected = upsert_silver(conn, source_file, file_date, clean)
+    return FileLoadResult(
+        source_file=source_file,
         rows_read=len(lines),
         rows_clean=len(clean),
         rows_quarantined=len(rejected),
         affected_dates=frozenset(affected),
+    )
+
+
+def load_order_file(conn: Conn, path: Path, file_date: date) -> FileLoadResult:
+    """Load one new daily order file through bronze into silver and record it in the ledger.
+
+    Args:
+        conn: Open database connection (inside the run transaction).
+        path: Order file to load.
+        file_date: Date parsed from the file name.
+
+    Returns:
+        Counts and the order dates touched.
+    """
+    lines = read_csv_lines(path, ORDER_COLUMNS)
+    ingest_bronze(conn, path.name, file_date, lines)
+    result = build_silver(conn, path.name, file_date, lines)
+    conn.execute(
+        "INSERT INTO ops.load_ledger (source_file, file_kind, sha256, rows_read, rows_clean, "
+        "rows_quarantined) VALUES (%s, 'orders', %s, %s, %s, %s)",
+        (
+            path.name,
+            file_sha256(path),
+            result.rows_read,
+            result.rows_clean,
+            result.rows_quarantined,
+        ),
     )
     logger.info(
         "loaded %s: %d rows, %d clean, %d quarantined",
@@ -443,6 +473,88 @@ def load_order_file(conn: Conn, path: Path, file_date: date) -> FileLoadResult:
         result.rows_quarantined,
     )
     return result
+
+
+def reprocess_file(conn: Conn, data_dir: Path, source_file: str) -> None:
+    """Replace an already-loaded file's bronze lines with its corrected version on disk.
+
+    The previous lines are archived in ``bronze.orders_superseded`` (bronze never loses data)
+    and the ledger hash is updated. Silver must be replayed afterwards (see ``replay_silver``)
+    so orders that the correction removed or changed are restated.
+
+    Args:
+        conn: Open database connection (inside the run transaction).
+        data_dir: Landing folder holding the corrected file.
+        source_file: File name, e.g. ``orders_2024-01-01.csv``.
+
+    Raises:
+        ReprocessError: If the name is not a daily order file, the file is missing, or it was
+            never loaded (a new file needs no reprocessing).
+    """
+    match = ORDER_FILE_RE.fullmatch(source_file)
+    if match is None:
+        raise ReprocessError(f"{source_file}: not a daily order file name")
+    path = data_dir / source_file
+    if not path.is_file():
+        raise ReprocessError(f"{path} not found")
+    known = conn.execute(
+        "SELECT 1 FROM ops.load_ledger WHERE source_file = %s", (source_file,)
+    ).fetchone()
+    if known is None:
+        raise ReprocessError(f"{source_file} was never loaded; a normal run will load it")
+
+    lines = read_csv_lines(path, ORDER_COLUMNS)
+    conn.execute(
+        "INSERT INTO bronze.orders_superseded SELECT *, now() FROM bronze.orders "
+        "WHERE source_file = %s",
+        (source_file,),
+    )
+    conn.execute("DELETE FROM bronze.orders WHERE source_file = %s", (source_file,))
+    ingest_bronze(conn, source_file, date.fromisoformat(match.group(1)), lines)
+    conn.execute(
+        "UPDATE ops.load_ledger SET sha256 = %s, loaded_at = now(), rows_read = %s "
+        "WHERE source_file = %s",
+        (file_sha256(path), len(lines), source_file),
+    )
+    logger.info("reprocessing %s: %d rows replace the previous version", source_file, len(lines))
+
+
+def replay_silver(conn: Conn) -> set[date]:
+    """Rebuild ``silver.orders`` and its quarantine from bronze, in delivery order.
+
+    Used after a validation or business-rule change, or after ``reprocess_file``. Files are
+    replayed oldest first, so "latest delivery wins" gives exactly the same result as the
+    original daily loads.
+
+    Args:
+        conn: Open database connection (inside the run transaction).
+
+    Returns:
+        Every order date present before or after the replay (all need a gold rebuild).
+    """
+    dates = silver_order_dates(conn)
+    conn.execute("TRUNCATE silver.orders, silver.orders_quarantine")
+    files = conn.execute(
+        "SELECT DISTINCT file_date, source_file FROM bronze.orders ORDER BY file_date, source_file"
+    ).fetchall()
+    for file_date, source_file in files:
+        lines = [
+            RawLine(line_no=line_no, raw_line=raw, fields=tuple(next(csv.reader([raw]))))
+            for line_no, raw in conn.execute(
+                "SELECT line_no, raw_line FROM bronze.orders WHERE source_file = %s "
+                "ORDER BY line_no",
+                (source_file,),
+            )
+        ]
+        result = build_silver(conn, source_file, file_date, lines)
+        conn.execute(
+            "UPDATE ops.load_ledger SET rows_clean = %s, rows_quarantined = %s "
+            "WHERE source_file = %s",
+            (result.rows_clean, result.rows_quarantined, source_file),
+        )
+        dates |= result.affected_dates
+    logger.info("replayed silver from bronze: %d file(s)", len(files))
+    return dates
 
 
 # --------------------------------------------------------------------------- gold
@@ -538,7 +650,7 @@ def export_gold(rows: list[DailySales], path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- orchestration
-def run(settings: Settings) -> RunSummary:
+def run(settings: Settings, *, rebuild: bool = False, reprocess: Sequence[str] = ()) -> RunSummary:
     """Run the pipeline once: load new files and rebuild the affected gold days.
 
     All database work happens in a single transaction behind an advisory lock, so a failed
@@ -546,6 +658,9 @@ def run(settings: Settings) -> RunSummary:
 
     Args:
         settings: Pipeline configuration.
+        rebuild: Replay silver (and therefore gold) from bronze, e.g. after a rule change.
+        reprocess: Already-loaded file names whose corrected versions should replace the
+            loaded ones; implies a replay.
 
     Returns:
         A summary of what was loaded and rebuilt.
@@ -563,11 +678,14 @@ def run(settings: Settings) -> RunSummary:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (PIPELINE_LOCK_ID,))
             apply_schema(conn)
             products_reloaded = load_products(conn, products_path)
+            for source_file in dict.fromkeys(reprocess):  # de-duplicated, order kept
+                reprocess_file(conn, settings.data_dir, source_file)
+            replayed = rebuild or bool(reprocess)
+            dates: set[date] = replay_silver(conn) if replayed else set()
             results = tuple(
                 load_order_file(conn, path, file_date)
                 for path, file_date in discover_order_files(conn, settings.data_dir)
             )
-            dates: set[date] = set()
             for result in results:
                 dates.update(result.affected_dates)
             if products_reloaded:  # a category change can restate any day
@@ -582,6 +700,8 @@ def run(settings: Settings) -> RunSummary:
     logger.info("gold rebuilt for %d date(s); exported to %s", len(dates), export_path)
     return RunSummary(
         files_loaded=results,
+        files_reprocessed=tuple(dict.fromkeys(reprocess)),
+        silver_replayed=replayed,
         products_reloaded=products_reloaded,
         dates_refreshed=tuple(sorted(dates)),
         gold_rows_written=gold_rows,
@@ -601,6 +721,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--database-url", help="PostgreSQL URL (env: PIPELINE_DATABASE_URL)")
     parser.add_argument("--data-dir", type=Path, help="landing folder (env: PIPELINE_DATA_DIR)")
     parser.add_argument("--out-dir", type=Path, help="export folder (env: PIPELINE_OUT_DIR)")
+    parser.add_argument(
+        "--reprocess",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="accept the corrected version of an already-loaded file (repeatable)",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="replay silver and gold from bronze (after a validation/business-rule change)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser
 
@@ -630,7 +762,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     settings = Settings(**overrides)
     try:
-        run(settings)
+        run(settings, rebuild=args.rebuild, reprocess=args.reprocess)
     except PipelineError as exc:
         logger.error("pipeline failed, nothing was committed: %s", exc)
         return 1

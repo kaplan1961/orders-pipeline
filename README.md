@@ -30,10 +30,13 @@ cp .env.example .env          # optional; defaults already match docker-compose
 ```bash
 uv run orders-pipeline                      # uses PIPELINE_* settings / .env
 uv run orders-pipeline --data-dir data --out-dir out --database-url postgresql://...
+uv run orders-pipeline --reprocess orders_2024-01-01.csv   # accept a corrected re-delivery
+uv run orders-pipeline --rebuild                           # re-derive silver/gold after a rule change
 ```
 
 Schedule it once a day after the new file lands. Each run loads only files not yet in
-`ops.load_ledger`, so re-running is safe. Exit codes: `0` success, `1` pipeline error (schema drift,
+`ops.load_ledger`, so re-running is safe. If an already-loaded file changes, the run fails until
+the correction is accepted with `--reprocess`. Exit codes: `0` success, `1` pipeline error (schema drift,
 changed source file, failed reconciliation), `2` database error. A failed run commits nothing.
 
 Query the result:

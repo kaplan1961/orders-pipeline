@@ -7,7 +7,7 @@ uv sync
 uv run orders-pipeline --data-dir data --out-dir out
 ```
 Output: table `gold.daily_sales`, also exported to `out/gold_daily_sales.csv` (the submitted
-output table). Tests: see README (`uv run pytest`, 68 tests, 99% coverage against a real Postgres).
+output table). Tests: see README (`uv run pytest`, 74 tests, 99% coverage against a real Postgres).
 
 ## Design
 ```
@@ -26,7 +26,11 @@ ops.load_ledger       -> which files were loaded, their sha256 and row counts
   file, or an already-loaded file whose content changed fails the run (exit code 1). Silently
   skipping a changed file would hide a restatement; reloading it would double count.
 - **Bronze** stores the exact delivered line plus untyped fields, so nothing is lost and any rule
-  can be replayed.
+  can be replayed: `--rebuild` re-derives silver and gold from bronze in delivery order.
+- **Corrections are explicit:** `--reprocess orders_2024-01-01.csv` accepts a corrected
+  re-delivery. The old lines move to `bronze.orders_superseded` (kept for audit), the new ones
+  replace them, and silver is replayed, so orders the correction removed disappear rather than
+  lingering.
 - **Silver** validates each row with a Pydantic model (`OrderRecord`). Bad rows go to quarantine with
   a stable `field:reason` code (e.g. `quantity:zero_quantity`). Good rows are upserted on
   `order_id` with `INSERT ... ON CONFLICT DO UPDATE WHERE (file_date, line_no) >= current`, so the
@@ -70,7 +74,6 @@ ops.load_ledger       -> which files were loaded, their sha256 and row counts
 ## Known limits / with more time
 - Alerting: fail or warn when quarantine volume or `Unknown` revenue exceeds a threshold, and
   reconcile bronze row counts against the source system's own totals if it can supply them.
-- An explicit `reprocess <file>` command for corrected files (today a changed file stops the run).
 - The product table is type 1 (overwritten), so a category change restates history. Production
   would want SCD2, or the category captured at sale time.
 - Bulk loading with `COPY` instead of `executemany`, and gold partitioned by `order_date`.
@@ -78,8 +81,24 @@ ops.load_ledger       -> which files were loaded, their sha256 and row counts
 - Orchestration (Airflow/Databricks Workflows), CI running the Postgres integration tests, and a
   data contract for the file schema.
 
+## If the data or requirements change
+- **A business rule changes** (say, AOV should exclude returns): change the SQL or model, update the
+  tests, then run `--rebuild`. Bronze makes history re-derivable without re-ingesting files.
+- **Upstream re-sends a corrected file:** the run fails loudly, then `--reprocess <file>` accepts it.
+- **A new column appears:** the strict header check stops the run. Add the column to the contract
+  (`ORDER_COLUMNS`, bronze, the model), then load. This is deliberate: silent schema drift is the
+  failure mode that corrupts reports.
+- **Late or out-of-order files:** already handled. Files are keyed by order, not by date, and the
+  newest delivery wins, so a late file can't overwrite newer data.
+- **More than one file per day** (e.g. `orders_2024-01-02_part2.csv`): widen `ORDER_FILE_RE` and
+  order deliveries by (file date, file name). The rest of the design is unchanged.
+- **Much larger volume:** `COPY` into bronze, set-based validation in SQL, gold partitioned by
+  `order_date`, and only the touched partitions rebuilt (which is already the logic). On Databricks,
+  see below.
+
 ## Databricks / Delta differences
-- **Ingest:** Auto Loader (`cloudFiles`) with a checkpoint replaces my ledger and file listing;
+- **Ingest:** Auto Loader (`cloudFiles`) with a checkpoint replaces my ledger and file listing
+  (`cloudFiles.allowOverwrites` plus a reprocess job covers corrected files);
   `rescuedDataColumn` captures extra or malformed fields; schema-evolution mode replaces my strict
   header check.
 - **Tables:** Delta bronze/silver/gold (medallion) in Unity Catalog instead of Postgres schemas.

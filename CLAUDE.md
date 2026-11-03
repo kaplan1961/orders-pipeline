@@ -20,6 +20,8 @@ uv sync                                   # create/refresh .venv from uv.lock
 docker compose up -d                      # local PostgreSQL 16 (dbs: orders, orders_test)
 uv run orders-pipeline                    # run once (PIPELINE_* env vars / .env)
 uv run orders-pipeline --data-dir data --out-dir out --database-url postgresql://...
+uv run orders-pipeline --reprocess orders_2024-01-01.csv   # accept a corrected re-delivery
+uv run orders-pipeline --rebuild                           # replay silver + gold from bronze
 
 uv run ruff format . && uv run ruff check . --fix
 uv run mypy src tests
@@ -56,10 +58,12 @@ Flow: `ops.load_ledger` (file + sha256) → `bronze.orders` (verbatim lines) →
   test inputs in `tmp_path`.
 - **Idempotent daily runs.** Only files missing from `ops.load_ledger` are loaded; a re-run is a
   no-op. An already-loaded file whose hash changed raises `SourceFileChangedError` and must never be
-  silently skipped or reloaded.
+  silently skipped or reloaded. Corrections are only accepted explicitly via `--reprocess FILE`.
 - **One transaction per run** behind `pg_advisory_xact_lock`. Run-level failures raise a
   `PipelineError` subclass (exit 1); database failures exit 2. A failed run leaves no partial state.
-- **Bronze is append-only** and stores each line exactly as delivered.
+- **Bronze never loses data.** It stores each line exactly as delivered; a reprocessed file's old
+  lines move to `bronze.orders_superseded`. Silver must always be re-derivable from bronze
+  (`--rebuild`), so never put information into silver that isn't in bronze.
 - **Silver has one row per `order_id`.** The latest `(file_date, line_no)` wins, and a stale or
   backfilled older file can never overwrite newer data.
 - **Bad rows are quarantined, never dropped or imputed**, with a stable `field:code` reason
@@ -80,7 +84,8 @@ dates are `MM/DD/YYYY`; epoch timestamps are UTC.
 
 **Changing a business rule is a three-place change:** update `NOTES.md`, `EXPECTED_GOLD` in
 `tests/test_pipeline.py` (hand-computed values, never copied from output), and regenerate
-`out/gold_daily_sales.csv` by running the pipeline on an empty database.
+`out/gold_daily_sales.csv` by running the pipeline on an empty database. Existing warehouses pick
+the change up with `uv run orders-pipeline --rebuild`.
 
 ## Non-negotiable rules
 

@@ -255,6 +255,8 @@ class RunSummary(BaseModel):
 
     Attributes:
         files_loaded: Per-file results for newly loaded order files (empty on a no-op run).
+        files_reprocessed: Already-loaded files whose corrected version replaced the old one.
+        silver_replayed: Whether silver was rebuilt from bronze (``--rebuild``/``--reprocess``).
         products_reloaded: Whether the product reference changed and was reloaded.
         dates_refreshed: Order dates whose gold rows were rebuilt.
         gold_rows_written: Gold rows inserted during the rebuild.
@@ -264,6 +266,8 @@ class RunSummary(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     files_loaded: tuple[FileLoadResult, ...]
+    files_reprocessed: tuple[str, ...] = ()
+    silver_replayed: bool = False
     products_reloaded: bool
     dates_refreshed: tuple[date, ...]
     gold_rows_written: int = Field(..., ge=0)

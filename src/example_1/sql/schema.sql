@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS bronze.orders (
     PRIMARY KEY (source_file, line_no)
 );
 
+-- Lines of a file version replaced via --reprocess: archived, never deleted.
+CREATE TABLE IF NOT EXISTS bronze.orders_superseded (
+    LIKE bronze.orders INCLUDING DEFAULTS,
+    superseded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Typed, validated, one row per order_id; the latest (file_date, line_no) version wins.
 CREATE TABLE IF NOT EXISTS silver.orders (
     order_id     TEXT          PRIMARY KEY,
