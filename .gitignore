@@ -23,3 +23,4 @@ htmlcov/
 # Output: keep the exported gold table (it is part of the submission), ignore anything else
 out/*
 !out/gold_daily_sales.csv
+.vscode/

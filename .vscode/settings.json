@@ -1,8 +1,0 @@
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
-  "python.analysis.extraPaths": ["src"],
-  "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["tests"],
-  "flake8.args": ["--max-line-length=100"],
-  "pylint.args": ["--max-line-length=100"]
-}
