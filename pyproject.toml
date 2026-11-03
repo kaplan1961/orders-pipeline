@@ -1,0 +1,50 @@
+[project]
+name = "example-1"
+version = "0.1.0"
+description = "Daily retail orders pipeline: raw CSV drops -> PostgreSQL bronze/silver/gold tables."
+readme = "README.md"
+authors = [
+    { name = "Michael Kaplan", email = "kaplanmnj@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[project.scripts]
+orders-pipeline = "example_1.pipeline:main"
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "D", "ANN", "RUF", "PTH", "LOG", "G"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
