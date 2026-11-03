@@ -28,6 +28,9 @@ uv run mypy src tests
 uv run pytest --cov=example_1 --cov-report=term-missing --cov-fail-under=90
 ```
 
+CI (`.github/workflows/ci.yml`) runs exactly these checks against PostgreSQL 16 on every push, and
+diffs `out/gold_daily_sales.csv` against a fresh run. Keep the workflow in step with the commands.
+
 Integration tests need `PIPELINE_TEST_DATABASE_URL` pointing at a **throwaway** database (the
 fixtures `DROP` the pipeline schemas). Without it they are skipped and only unit tests run.
 This is a Windows project; in PowerShell set it with
@@ -138,7 +141,7 @@ stable ordering and exact decimals.
 ## Definition of done
 
 - [ ] Ruff format/check, `mypy --strict src tests` and pytest (≥ 90% coverage, DB tests *not*
-      skipped) all pass.
+      skipped) all pass locally, and CI is green after pushing.
 - [ ] New or changed code has docstrings, type hints and Pydantic models where data crosses a boundary.
 - [ ] Pipeline invariants still hold; any business-rule change is reflected in NOTES.md, the tests
       and `out/gold_daily_sales.csv`.

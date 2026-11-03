@@ -1,0 +1,4 @@
+# Source drops and the exported output must stay byte-for-byte as produced: the pipeline hashes
+# source files (ops.load_ledger) and CI diffs the output table. Never convert their line endings.
+data/** -text
+out/** -text

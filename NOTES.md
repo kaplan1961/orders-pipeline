@@ -1,5 +1,21 @@
 # NOTES
 
+## TL;DR
+- **Design:** daily files land in `bronze` (every raw line, nothing lost). They flow into `silver`
+  (one validated row per order; bad rows are quarantined with a reason), then into
+  `gold.daily_sales`. Gold is rebuilt from silver for the affected days and reconciled against it.
+  Each run is one transaction, and re-runs are no-ops.
+- **Key judgement calls:** the latest delivery of an order wins (O1003 in the day-2 file restates
+  Jan 1). Returns reduce revenue and units but aren't orders. Zero-quantity and truncated rows are
+  quarantined. Unknown products are kept as `Unknown`. A changed file fails the run loudly
+  (`--reprocess` accepts it).
+- **Output:** 16 rows in `out/gold_daily_sales.csv`: $1,744.13 net revenue, 19 orders, 52 units
+  over 2 days.
+- **Verified:** 74 tests against real PostgreSQL (99% coverage) in CI, plus an independent
+  recomputation of every output row from the raw CSVs.
+- **On Databricks:** Auto Loader + `MERGE` + `replaceWhere` + DLT expectations (see the last
+  section).
+
 ## How to run
 ```
 docker compose up -d     # PostgreSQL 16 (or point PIPELINE_DATABASE_URL at any Postgres 14+)

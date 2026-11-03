@@ -1,5 +1,7 @@
 # Daily Orders Pipeline
 
+[![CI](https://github.com/kaplan1961/orders-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/kaplan1961/orders-pipeline/actions/workflows/ci.yml)
+
 Loads the retail order system's daily CSV drops and the product reference into PostgreSQL and
 builds `gold.daily_sales`: net revenue, order count, units sold and average order value per
 **day × product category × region**.
@@ -57,6 +59,9 @@ PIPELINE_TEST_DATABASE_URL=postgresql://pipeline:pipeline@localhost:5432/orders_
 ```
 
 PowerShell: `$env:PIPELINE_TEST_DATABASE_URL="postgresql://pipeline:pipeline@localhost:5432/orders_test"; uv run pytest --cov=example_1 --cov-fail-under=90`
+
+CI (`.github/workflows/ci.yml`) runs all of the above against PostgreSQL 16 on every push, and
+checks that `out/gold_daily_sales.csv` matches a fresh pipeline run.
 
 Without `PIPELINE_TEST_DATABASE_URL` the database tests are skipped and the unit tests still run.
 
